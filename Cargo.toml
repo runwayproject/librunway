@@ -1,0 +1,12 @@
+[package]
+name = "librunway"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-only"
+description = "Runway protocol library"
+
+[dependencies]
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_cbor = "0.11.2"
+sha2 = "0.10.9"
