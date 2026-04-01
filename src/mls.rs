@@ -182,6 +182,31 @@ pub fn add_members_and_get_commit(
     Ok((commit, welcome))
 }
 
+pub fn leave_group_and_get_commit(
+    group: &mut MlsGroup,
+    provider: &OpenMlsRustCrypto,
+    signer: &SignatureKeyPair,
+) -> Result<openmls::prelude::MlsMessageOut> {
+    let proposal = group
+        .leave_group(provider, signer)
+        .context("creating leave proposal failed")?;
+    Ok(proposal)
+}
+
+pub fn commit_pending_proposals_and_merge(
+    group: &mut MlsGroup,
+    provider: &OpenMlsRustCrypto,
+    signer: &SignatureKeyPair,
+) -> Result<openmls::prelude::MlsMessageOut> {
+    let (commit, _, _) = group
+        .commit_to_pending_proposals(provider, signer)
+        .context("creating commit from pending proposals failed")?;
+    group
+        .merge_pending_commit(provider)
+        .context("merging pending proposal commit failed")?;
+    Ok(commit)
+}
+
 pub fn join_from_welcome(
     provider: &OpenMlsRustCrypto,
     mls_group_join_config: &openmls::group::MlsGroupJoinConfig,
