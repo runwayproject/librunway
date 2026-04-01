@@ -10,6 +10,58 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
+pub struct RelayClient {
+    server_addr: String,
+    signing_key: SigningKey,
+    max_frame_bytes: usize,
+}
+
+impl RelayClient {
+    pub fn new(server_addr: impl Into<String>, signing_key: SigningKey) -> Self {
+        Self {
+            server_addr: server_addr.into(),
+            signing_key,
+            max_frame_bytes: MAX_FRAME_BYTES,
+        }
+    }
+
+    pub fn server_addr(&self) -> &str {
+        &self.server_addr
+    }
+
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    pub fn issue_rid(&self) -> Result<ServerPacket> {
+        issue_rid(self.server_addr(), &self.signing_key)
+    }
+
+    pub fn rotate_rid(&self, rid: &str) -> Result<ServerPacket> {
+        rotate_rid(self.server_addr(), &self.signing_key, rid)
+    }
+
+    pub fn fetch_queued(&self, rid: &str) -> Result<ServerPacket> {
+        fetch_queued(self.server_addr(), &self.signing_key, rid)
+    }
+
+    pub fn put_blob(&self, relay_addr: &str, blob: EncryptedBlob) -> Result<ServerPacket> {
+        send_client_packet_with_limit(
+            relay_addr,
+            ClientPacket::PutBlob { blob },
+            self.max_frame_bytes,
+        )
+    }
+
+    pub fn put_blob_default(&self, blob: EncryptedBlob) -> Result<ServerPacket> {
+        self.put_blob(self.server_addr(), blob)
+    }
+
+    pub fn send_client_packet(&self, relay_addr: &str, packet: ClientPacket) -> Result<ServerPacket> {
+        send_client_packet_with_limit(relay_addr, packet, self.max_frame_bytes)
+    }
+}
+
 pub fn issue_rid(addr: &str, signing_key: &SigningKey) -> Result<ServerPacket> {
     let auth = make_auth(signing_key, "issue_rid", b"");
     send_client_packet(addr, ClientPacket::IssueRid { auth })
@@ -42,10 +94,18 @@ pub fn put_blob(addr: &str, blob: EncryptedBlob) -> Result<ServerPacket> {
 }
 
 pub fn send_client_packet(addr: &str, packet: ClientPacket) -> Result<ServerPacket> {
+    send_client_packet_with_limit(addr, packet, MAX_FRAME_BYTES)
+}
+
+fn send_client_packet_with_limit(
+    addr: &str,
+    packet: ClientPacket,
+    max_frame_bytes: usize,
+) -> Result<ServerPacket> {
     let mut stream = TcpStream::connect(addr).with_context(|| format!("connect to {}", addr))?;
     let bytes = encode_packet(&packet)?;
     write_framed(&mut stream, &bytes)?;
-    let frame = read_framed(&mut stream, MAX_FRAME_BYTES)?;
+    let frame = read_framed(&mut stream, max_frame_bytes)?;
     let response: ServerPacket = decode_packet(&frame)?;
     Ok(response)
 }
