@@ -11,8 +11,124 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::types::Ciphersuite;
 use openmls_traits::types::SignatureScheme::ED25519;
-use std::collections::HashMap;
+use serde::{Deserialize as SerdeDeserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use tls_codec::{Deserialize, DeserializeBytes};
+
+pub const RUNWAY_GROUP_METADATA_EXTENSION_TYPE: u16 = 0xff01;
+pub const RUNWAY_LEAF_NICKNAME_EXTENSION_TYPE: u16 = 0xff02;
+pub const RUNWAY_GROUP_METADATA_VERSION: u8 = 1;
+pub const RUNWAY_LEAF_NICKNAME_VERSION: u8 = 1;
+pub type MemberId = Vec<u8>;
+pub type MemberIdList = Vec<MemberId>;
+
+// see runway spec 7.5.1
+#[derive(Debug, Clone, Serialize, SerdeDeserialize)]
+pub struct RunwayGroupMetadata {
+    pub v: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub admins: MemberIdList,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nick_overrides: BTreeMap<MemberId, String>,
+}
+impl RunwayGroupMetadata {
+    pub fn new(admins: MemberIdList) -> Self {
+        Self {
+            v: RUNWAY_GROUP_METADATA_VERSION,
+            group_name: None,
+            topic: None,
+            admins,
+            nick_overrides: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, SerdeDeserialize)]
+pub struct RunwayLeafNickname {
+    pub v: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+}
+
+impl RunwayLeafNickname {
+    pub fn new(nickname: Option<String>) -> Self {
+        Self {
+            v: RUNWAY_LEAF_NICKNAME_VERSION,
+            nickname,
+        }
+    }
+}
+
+pub fn credential_identity_bytes(credential_with_key: &CredentialWithKey) -> MemberId {
+    credential_with_key.credential.serialized_content().to_vec()
+}
+// various helper functions for encoding/decoding
+pub fn group_metadata_to_bytes(metadata: &RunwayGroupMetadata) -> Result<Vec<u8>> {
+    let bytes = serde_cbor::to_vec(metadata).context("encoding RunwayGroupMetadata failed")?;
+    Ok(bytes)
+}
+
+pub fn bytes_to_group_metadata(bytes: &[u8]) -> Result<RunwayGroupMetadata> {
+    let metadata =
+        serde_cbor::from_slice(bytes).context("decoding RunwayGroupMetadata from CBOR failed")?;
+    Ok(metadata)
+}
+
+pub fn leaf_nickname_to_bytes(nickname: &RunwayLeafNickname) -> Result<Vec<u8>> {
+    let bytes = serde_cbor::to_vec(nickname).context("encoding RunwayLeafNickname failed")?;
+    Ok(bytes)
+}
+
+pub fn bytes_to_leaf_nickname(bytes: &[u8]) -> Result<RunwayLeafNickname> {
+    let nickname =
+        serde_cbor::from_slice(bytes).context("decoding RunwayLeafNickname from CBOR failed")?;
+    Ok(nickname)
+}
+
+pub fn group_metadata_extension(metadata: &RunwayGroupMetadata) -> Result<Extension> {
+    let bytes = group_metadata_to_bytes(metadata)?;
+    Ok(Extension::Unknown(
+        RUNWAY_GROUP_METADATA_EXTENSION_TYPE,
+        UnknownExtension(bytes),
+    ))
+}
+
+pub fn leaf_nickname_extension(nickname: &RunwayLeafNickname) -> Result<Extension> {
+    let bytes = leaf_nickname_to_bytes(nickname)?;
+    Ok(Extension::Unknown(
+        RUNWAY_LEAF_NICKNAME_EXTENSION_TYPE,
+        UnknownExtension(bytes),
+    ))
+}
+
+pub fn decode_group_metadata_extension(
+    extension: &Extension,
+) -> Result<Option<RunwayGroupMetadata>> {
+    match extension {
+        Extension::Unknown(extension_type, UnknownExtension(bytes))
+            if *extension_type == RUNWAY_GROUP_METADATA_EXTENSION_TYPE =>
+        {
+            let metadata = bytes_to_group_metadata(bytes)?;
+            Ok(Some(metadata))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub fn decode_leaf_nickname_extension(extension: &Extension) -> Result<Option<RunwayLeafNickname>> {
+    match extension {
+        Extension::Unknown(extension_type, UnknownExtension(bytes))
+            if *extension_type == RUNWAY_LEAF_NICKNAME_EXTENSION_TYPE =>
+        {
+            let nickname = bytes_to_leaf_nickname(bytes)?;
+            Ok(Some(nickname))
+        }
+        _ => Ok(None),
+    }
+}
 
 pub struct IdentityBundle {
     pub ciphersuite: Ciphersuite,
@@ -98,31 +214,43 @@ pub fn create_identity_from_persisted(
 }
 
 pub fn create_group(identity_bundle: &IdentityBundle) -> MlsGroup {
+    // creator is the initial admin
+    let admin_id = credential_identity_bytes(&identity_bundle.credential_with_key);
+    let group_metadata = RunwayGroupMetadata::new(vec![admin_id]);
+    let group_metadata_extension = group_metadata_extension(&group_metadata)
+        .expect("encoding group metadata extension failed");
+    // extensions
+    let group_context_extensions = Extensions::try_from(vec![
+        Extension::ExternalSenders(vec![ExternalSender::new(
+            identity_bundle.credential_with_key.signature_key.clone(),
+            identity_bundle.credential_with_key.credential.clone(),
+        )]),
+        group_metadata_extension,
+    ])
+    .expect("failed to create group context extensions list");
+    // leaf extension has the nickname of the user
+    let leaf_nickname_extension = leaf_nickname_extension(&RunwayLeafNickname::new(None))
+        .expect("encoding leaf nickname extension failed");
+    let leaf_node_extensions = Extensions::single(leaf_nickname_extension)
+        .expect("failed to create leaf node extensions list");
+
     let mls_group_create_config = MlsGroupCreateConfig::builder()
         .padding_size(100)
         .sender_ratchet_configuration(SenderRatchetConfiguration::new(10, 2000))
-        .with_group_context_extensions(
-            Extensions::single(Extension::ExternalSenders(vec![ExternalSender::new(
-                identity_bundle.credential_with_key.signature_key.clone(),
-                identity_bundle.credential_with_key.credential.clone(),
-            )]))
-            .expect("failed to create single-element extensions list"),
-        )
+        .with_group_context_extensions(group_context_extensions)
         .ciphersuite(identity_bundle.ciphersuite)
         .capabilities(Capabilities::new(
             None,
             None,
-            Some(&[ExtensionType::Unknown(0xff00)]),
+            // advertise required extensions
+            Some(&[
+                ExtensionType::Unknown(RUNWAY_GROUP_METADATA_EXTENSION_TYPE),
+                ExtensionType::Unknown(RUNWAY_LEAF_NICKNAME_EXTENSION_TYPE),
+            ]),
             None,
             Some(&[CredentialType::Basic]),
         ))
-        .with_leaf_node_extensions(
-            Extensions::single(Extension::Unknown(
-                0xff00,
-                UnknownExtension(vec![0, 1, 2, 3]),
-            ))
-            .expect("failed to create single-element extensions list"),
-        )
+        .with_leaf_node_extensions(leaf_node_extensions)
         .expect("failed to configure leaf extensions")
         .use_ratchet_tree_extension(true)
         .build();
